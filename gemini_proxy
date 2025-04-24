@@ -1,0 +1,323 @@
+import os
+import requests
+import httpx
+import json
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, Field
+from typing import List, Optional, Dict, Any, AsyncGenerator, Union
+import uvicorn
+from dotenv import load_dotenv
+import uuid
+import time
+import asyncio
+
+# Load environment variables from .env file
+load_dotenv()
+
+# Get Google API Key from environment variable
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+if not GOOGLE_API_KEY:
+    raise ValueError("GOOGLE_API_KEY environment variable not set.")
+
+# Google Gemini API endpoints
+GEMINI_GENERATE_CONTENT_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
+GEMINI_STREAM_GENERATE_CONTENT_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:streamGenerateContent"
+
+app = FastAPI(
+    title="Gemini Proxy API",
+    description="A proxy service to interact with Google Gemini API using OpenAI-compatible interface.",
+    version="1.0.0"
+)
+
+# --- OpenAI Compatible Models ---
+
+class ChatMessage(BaseModel):
+    role: str
+    content: str
+
+class ChatCompletionRequest(BaseModel):
+    model: str = "gemini-1.5-flash" # Model name is often required by clients
+    messages: List[ChatMessage]
+    max_tokens: Optional[int] = None
+    temperature: Optional[float] = 1.0 # Default temperature
+    stream: Optional[bool] = False # Add stream parameter
+    # Add other OpenAI parameters if needed, map them accordingly
+
+class ChatCompletionChoice(BaseModel):
+    index: int
+    message: ChatMessage
+    finish_reason: str = "stop" # Gemini API doesn't directly provide this, default to 'stop'
+
+class Usage(BaseModel):
+    prompt_tokens: int = 0 # Gemini API doesn't provide token counts
+    completion_tokens: int = 0
+    total_tokens: int = 0
+
+class ChatCompletionResponse(BaseModel):
+    id: str = Field(default_factory=lambda: f"chatcmpl-{uuid.uuid4().hex}")
+    object: str = "chat.completion"
+    created: int = Field(default_factory=lambda: int(time.time()))
+    model: str
+    choices: List[ChatCompletionChoice]
+    usage: Usage = Field(default_factory=Usage)
+
+# --- OpenAI Compatible Streaming Models ---
+
+class ChatCompletionChunkDelta(BaseModel):
+    content: Optional[str] = None
+    role: Optional[str] = None
+
+class ChatCompletionChunkChoice(BaseModel):
+    index: int
+    delta: ChatCompletionChunkDelta
+    finish_reason: Optional[str] = None
+
+class ChatCompletionChunk(BaseModel):
+    id: str = Field(default_factory=lambda: f"chatcmpl-{uuid.uuid4().hex}")
+    object: str = "chat.completion.chunk"
+    created: int = Field(default_factory=lambda: int(time.time()))
+    model: str
+    choices: List[ChatCompletionChunkChoice]
+
+# --- Gemini API Models (Simplified) ---
+
+class GeminiPart(BaseModel):
+    text: str
+
+class GeminiContent(BaseModel):
+    parts: List[GeminiPart]
+    role: Optional[str] = None # Role is needed for history
+
+class GeminiSafetyRating(BaseModel):
+    category: str
+    probability: str
+
+class GeminiPromptFeedback(BaseModel):
+    safetyRatings: List[GeminiSafetyRating]
+
+class GeminiCandidate(BaseModel):
+    content: Optional[GeminiContent] = None # Make content optional
+    finishReason: Optional[str] = None
+    index: Optional[int] = None # Make index optional
+    safetyRatings: Optional[List[GeminiSafetyRating]] = None # Make safetyRatings optional
+    tokenCount: Optional[int] = None # Add tokenCount if it might be missing
+
+class GeminiResponse(BaseModel):
+    candidates: List[GeminiCandidate]
+    promptFeedback: Optional[GeminiPromptFeedback] = None
+
+# --- API Endpoint ---
+
+@app.post("/v1/chat/completions")
+async def chat_completions(request: ChatCompletionRequest):
+    """Handles chat completion requests compatible with OpenAI API, supporting streaming."""
+    """Handles chat completion requests compatible with OpenAI API."""
+
+    if not request.messages:
+        raise HTTPException(status_code=400, detail="'messages' field is required.")
+
+    # Determine API URL based on stream flag
+    api_url = f"{GEMINI_STREAM_GENERATE_CONTENT_URL}?key={GOOGLE_API_KEY}&alt=sse" if request.stream else f"{GEMINI_GENERATE_CONTENT_URL}?key={GOOGLE_API_KEY}"
+
+    # Convert OpenAI messages to Gemini format
+    # Simple conversion: concatenate messages into a single prompt
+    # More complex scenarios might require handling roles and history differently
+    # For gemini-1.5-flash, it's often best to provide history directly
+    gemini_contents = []
+    for msg in request.messages:
+        # Gemini uses 'user' and 'model' roles
+        role = "user" if msg.role == "user" else "model"
+        gemini_contents.append(GeminiContent(parts=[GeminiPart(text=msg.content)], role=role))
+
+    # Construct Gemini request payload
+    gemini_payload = {
+        "contents": [content.model_dump(exclude_none=True) for content in gemini_contents],
+        # Add generationConfig mapping if needed (e.g., temperature, max_tokens)
+        "generationConfig": {
+            # "maxOutputTokens": request.max_tokens, # Map max_tokens if provided
+            "temperature": request.temperature
+        }
+    }
+
+    if request.stream:
+        # Handle streaming request
+        return StreamingResponse(
+            _stream_gemini_response(api_url, gemini_payload, request.model),
+            media_type="text/event-stream"
+        )
+    else:
+        # Handle non-streaming request
+        try:
+            # Send request to Google Gemini API
+            response = requests.post(
+                api_url,
+                headers={"Content-Type": "application/json"},
+                json=gemini_payload
+            )
+            response.raise_for_status() # Raise exception for bad status codes (4xx or 5xx)
+
+            gemini_response_data = response.json()
+            gemini_response = GeminiResponse(**gemini_response_data)
+
+            # Check if candidates exist and have content
+            if not gemini_response.candidates or not gemini_response.candidates[0].content or not gemini_response.candidates[0].content.parts:
+                 # Handle cases where the response might be blocked or empty
+                 finish_reason = "stop"
+                 generated_text = "" # Default to empty string if no content
+                 candidate_index = 0 # Default index
+                 if gemini_response.candidates:
+                     candidate = gemini_response.candidates[0]
+                     if candidate.finishReason:
+                         finish_reason = candidate.finishReason.lower()
+                         if finish_reason != "stop": # e.g., SAFETY, RECITATION, OTHER
+                             generated_text = f"[Content blocked due to: {finish_reason}]"
+                     # Use candidate index if available, otherwise default to 0
+                     candidate_index = candidate.index if candidate.index is not None else 0
+
+                 choice = ChatCompletionChoice(
+                     index=candidate_index,
+                     message=ChatMessage(role="assistant", content=generated_text),
+                     finish_reason=finish_reason
+                 )
+            else:
+                # Extract the generated text from the first candidate
+                candidate = gemini_response.candidates[0]
+                generated_text = candidate.content.parts[0].text
+                finish_reason = candidate.finishReason.lower() if candidate.finishReason else "stop"
+                candidate_index = candidate.index if candidate.index is not None else 0 # Use candidate index if available
+
+                # Convert Gemini response back to OpenAI format
+                choice = ChatCompletionChoice(
+                    index=candidate_index,
+                    message=ChatMessage(role="assistant", content=generated_text),
+                    finish_reason=finish_reason
+                )
+
+            # Create OpenAI compatible response
+            openai_response = ChatCompletionResponse(
+                model=request.model, # Return the requested model name
+                choices=[choice]
+                # Usage data is not provided by Gemini API, returning zeros
+            )
+
+            return openai_response
+
+        except requests.exceptions.RequestException as e:
+            print(f"Error calling Google Gemini API: {e}")
+        # Attempt to parse error details from Google's response if available
+        error_detail = f"Error communicating with Google Gemini API: {e}"
+        try:
+            error_body = response.json()
+            if 'error' in error_body and 'message' in error_body['error']:
+                error_detail = f"Google API Error: {error_body['error']['message']}"
+        except Exception:
+            pass # Keep the original requests exception message
+        # raise HTTPException(status_code=500, detail=error_detail)
+        
+        # except Exception as e:
+        #     print(f"An unexpected error occurred: {e}")
+        #     raise HTTPException(status_code=500, detail=f"An internal server error occurred: {str(e)}")
+
+# --- Streaming Logic --- 
+
+async def _stream_gemini_response(api_url: str, payload: Dict[str, Any], model_name: str) -> AsyncGenerator[str, None]:
+    """Asynchronously streams responses from Gemini and formats them as SSE."""
+    try:
+        async with httpx.AsyncClient(timeout=None) as client:
+            async with client.stream("POST", api_url, json=payload, headers={"Content-Type": "application/json"}) as response:
+                response.raise_for_status() # Raise exception for bad status codes
+                chunk_id = f"chatcmpl-{uuid.uuid4().hex}"
+                created_time = int(time.time())
+                async for line in response.aiter_lines():
+                    if line.startswith('data: '):
+                        data_str = line[len('data: '):]
+                        try:
+                            chunk_data = json.loads(data_str)
+                            gemini_chunk = GeminiResponse(**chunk_data)
+
+                            if gemini_chunk.candidates and gemini_chunk.candidates[0].content and gemini_chunk.candidates[0].content.parts:
+                                delta_content = gemini_chunk.candidates[0].content.parts[0].text
+                                finish_reason = gemini_chunk.candidates[0].finishReason
+                                index = gemini_chunk.candidates[0].index if gemini_chunk.candidates[0].index is not None else 0
+
+                                chunk = ChatCompletionChunk(
+                                    id=chunk_id,
+                                    model=model_name,
+                                    created=created_time,
+                                    choices=[
+                                        ChatCompletionChunkChoice(
+                                            index=index,
+                                            delta=ChatCompletionChunkDelta(content=delta_content),
+                                            finish_reason=finish_reason.lower() if finish_reason else None
+                                        )
+                                    ]
+                                )
+                                yield f"data: {chunk.model_dump_json()}\n\n"
+                            elif gemini_chunk.candidates and gemini_chunk.candidates[0].finishReason:
+                                # Handle potential finish reason without content (e.g., safety block)
+                                finish_reason = gemini_chunk.candidates[0].finishReason
+                                index = gemini_chunk.candidates[0].index if gemini_chunk.candidates[0].index is not None else 0
+                                chunk = ChatCompletionChunk(
+                                    id=chunk_id,
+                                    model=model_name,
+                                    created=created_time,
+                                    choices=[
+                                        ChatCompletionChunkChoice(
+                                            index=index,
+                                            delta=ChatCompletionChunkDelta(), # Empty delta
+                                            finish_reason=finish_reason.lower() if finish_reason else None
+                                        )
+                                    ]
+                                )
+                                yield f"data: {chunk.model_dump_json()}\n\n"
+
+                        except json.JSONDecodeError:
+                            print(f"Warning: Could not decode JSON chunk: {data_str}")
+                        except Exception as e:
+                            print(f"Error processing chunk: {e}")
+                            # Optionally yield an error message to the client
+                            # yield f"data: {{"error": "Error processing stream chunk"}}\n\n"
+
+        # Send the final [DONE] message
+        yield "data: [DONE]\n\n"
+
+    except httpx.RequestError as e:
+        print(f"Error during streaming request to Google Gemini API: {e}")
+        # Yield an error message in SSE format
+        error_payload = {"error": {"message": f"Error communicating with Google Gemini API: {e}", "type": "api_connection_error", "param": None, "code": None}}
+        yield f"data: {json.dumps(error_payload)}\n\n"
+        yield "data: [DONE]\n\n"
+    except httpx.HTTPStatusError as e:
+        print(f"HTTP error during streaming request: {e.response.status_code} - {e.response.text}")
+        error_message = f"Google API Error: {e.response.status_code}"
+        try:
+            error_body = e.response.json()
+            if 'error' in error_body and 'message' in error_body['error']:
+                error_message = f"Google API Error: {error_body['error']['message']}"
+        except Exception:
+            pass
+        error_payload = {"error": {"message": error_message, "type": "api_error", "param": None, "code": e.response.status_code}}
+        yield f"data: {json.dumps(error_payload)}\n\n"
+        yield "data: [DONE]\n\n"
+    except Exception as e:
+        print(f"An unexpected error occurred during streaming: {e}")
+        error_payload = {"error": {"message": f"An internal server error occurred during streaming: {str(e)}", "type": "internal_server_error", "param": None, "code": None}}
+        yield f"data: {json.dumps(error_payload)}\n\n"
+        yield "data: [DONE]\n\n"
+
+# Health check endpoint
+@app.get("/health")
+async def health_check():
+    return {"status": "ok"}
+
+if __name__ == "__main__":
+    # Run the FastAPI server using uvicorn
+    # Listen on all available network interfaces (0.0.0.0)
+    # Use port 443 by default, can be overridden by PORT environment variable
+    port = int(os.getenv("PORT", 443))
+    print(f"Starting server on http://0.0.0.0:{port}")
+    uvicorn.run(app, host="0.0.0.0", port=port)
+
+
+    
